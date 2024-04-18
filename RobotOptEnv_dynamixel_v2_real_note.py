@@ -67,11 +67,11 @@ class RobotOptEnv(gym.Env):
         self.res = self.motor.dynamixel_member
         self.high_torque = float('inf') # 預設標準值 馬達極限 120.0 N max
         self.low_torque = float('-inf') # 預設標準值 馬達極限 -12.0 N max
-        self.motor_cost_init = np.array([0,400,400,0,0,0], dtype=np.float64) # 預設最大馬達費用
+        self.motor_cost_init = np.array([0,400,400,0,0,0], dtype=np.float64) # 預設最大馬達費用(未用到)
         self.motor_weight_init = np.array([0,0.855,0.855,0,0,0], dtype=np.float64) # 預設最大馬達重量
-        self.motor_cost = np.array([0,400,400,0,0,0], dtype=np.float64) # 馬達費用
+        self.motor_cost = np.array([0,400,400,0,0,0], dtype=np.float64) # 馬達費用(未用到)
         self.motor_weight = np.array([0,0.855,0.855,0,0,0], dtype=np.float64) # 馬達重量
-        self.motor_rated = np.array([44.7,44.7,44.7,44.7,44.7,44.7], dtype=np.float64)
+        self.motor_rated = np.array([44.7,44.7,44.7,44.7,44.7,44.7], dtype=np.float64)#最大馬達扭矩
         # 使用者設定參數 & 觀察參數
         self.reach_distance = 0.6 # 使用者設定可達半徑最小值
         self.high_reach_eva = 1 # 預設觀測標準值
@@ -86,6 +86,12 @@ class RobotOptEnv(gym.Env):
         self.low_ratio_over = 0 # 預設觀測標準值
         self.high_torque_over = 10 # 預設觀測標準值
         self.low_torque_over = 0 # 預設觀測標準值
+        self.outer_radius_std = 15   # 預設觀測標準值(外徑固定)
+        self.inner_radius_std_L2 = 12.5   # 預設觀測標準值(L2內徑)
+        self.inner_radius_std_L3 = 12.5   # 預設觀測標準值(L3內徑)
+
+        
+
         self.high_power_consumption = float('inf')
         self.low_power_consumption = float('-inf')
         self.torque_done = np.array([false, false, false, false, false, false])
@@ -94,6 +100,8 @@ class RobotOptEnv(gym.Env):
         self.prev_shaping = None
         self.motor_type_axis_2 = 5.1
         self.motor_type_axis_3 = 5.1
+        self.motor_weight_axis_2 = 0.34 #預設M1馬達重量340g
+        self.motor_weight_axis_3 = 0.34
         self.mission_time = 0
         self.low_torque_cost = -200
         self.high_torque_cost = 200
@@ -104,8 +112,9 @@ class RobotOptEnv(gym.Env):
         self.MIN_LENGTH = 5
         # self.torque_sum_list = [10.2, 30.4, 49.8, 50.6, 70, 89.4]
         self.torque_sum_list = [89.4, 70, 50.6, 49.8, 30.4, 10.2]
+        self.motor_weight_list = {44.7: 0.855, 25.3: 0.732,5.1: 0.34}        #馬達扭矩映射重量
         self.train_flag = 1
-        # TODO: 增加馬達模組選型action
+        # TODO: 增加馬達模組選型action(工作空間)
         self.action_space = spaces.Discrete(10) # TODO: fixed 12種action
         
         # TODO: observation space for torque, reach, motor cost, weight, manipulability
@@ -168,7 +177,7 @@ class RobotOptEnv(gym.Env):
     # TODO: fixed
     def step(self, action):
         assert self.action_space.contains(action), "%r (%s) invalid"%(action, type(action))
-        if self.action_select == 'variable':
+        if self.action_select == 'variable':    #單獨調整連桿長度或選擇馬達
             if action == 0: 
                 self.std_L2 -= 1.0
             elif action == 1:
@@ -190,7 +199,7 @@ class RobotOptEnv(gym.Env):
             elif action == 9:
                 self.motor_type_axis_3 = 44.7
           
-        elif self.action_select == 'fixed':
+        elif self.action_select == 'fixed':     #總長固定
             if action == 0: # 軸2  # 短 # 型號1
                 self.std_L2 -= 1.0
                 self.std_L3 += 1.0
@@ -266,18 +275,20 @@ class RobotOptEnv(gym.Env):
             consumption = 2000
 
         # self.state[0] = ratio_over
-        self.state[0] = torque_over
-        self.state[1] = np.abs(consumption)
-        self.state[2] = reach_score
-        self.state[3] = manipulability_score
-        self.state[4] = self.std_L2
-        self.state[5] = self.std_L3
-        self.state[6] = self.motor_type_axis_2 + self.motor_type_axis_3
+        self.state[0] = torque_over                 #超出額定連續扭矩次數
+        self.state[1] = np.abs(consumption)         #功率
+        self.state[2] = reach_score                 #可達性
+        self.state[3] = manipulability_score        #可操控性
+        self.state[4] = self.std_L2                 #大臂長度
+        self.state[5] = self.std_L3                 #小臂長度
+        self.state[6] = self.motor_type_axis_2 + self.motor_type_axis_3     #總馬達扭矩大小
+        self.state[7] = self.inner_radius_std_L2    #大臂內徑 
+        self.state[8] = self.inner_radius_std_L3    #小臂內徑
         self.counts += 1
         reward = 0
         
         # TODO: case all
-        if self.train_flag == 1:
+        if self.train_flag == 1:#train_flag可從ddrl_param.yaml更改
             if self.state[2] == 1 and self.reachable_tmp == 1:
                 shaping = (
                             # - self.state[6]/5 # 馬達扭矩成本
@@ -324,7 +335,7 @@ class RobotOptEnv(gym.Env):
                 reward += -200
             percent = 100 - self.state[2] * 100
             reward += -percent
-            # ratio_score = self.state[0]
+            # rati o_score = self.state[0]
             torque_score = self.state[0]
             # reward -= ratio_score * 3
             reward -= torque_score * 3
@@ -431,6 +442,96 @@ class RobotOptEnv(gym.Env):
                         if self.torque_sum_list[x] == self.state[6]:
                             reward += x * 10
 
+        # TODO: case 5 all plus deflection
+                            
+
+        if self.train_flag == 5:    #reachable_tmp和reach_score的排列組合來更動獎勵整型函數
+            
+            L3_def = (1.412*(self.state[5]**3))/((self.outer_radius_std**4)-(self.state[8]**4)) #小臂撓度
+            L2_def = ((1.412+self.motor_weight_axis_3)*(self.state[4]**3))/((self.outer_radius_std**4)-(self.state[7]**4)) #大臂撓度
+            
+            if self.state[2] == 1 and self.reachable_tmp == 1:      #最好狀況(現在和上一刻可達性都等於1)
+                shaping = (
+                            # - self.state[6]/5 # 馬達扭矩成本
+                            - 5*L3_def
+                            - 5*L2_def
+                            - self.state[1]/5 # 功耗
+                            + 2000 * self.state[3] # 可操作性
+                        ) 
+                if self.prev_shaping != None:   #prev_shaping原為0(None)
+                    reward = shaping - self.prev_shaping
+                self.prev_shaping = shaping
+            elif self.state[2] == 1 and self.reachable_tmp != 1:    #現在可達＝1,但上一刻不等於1
+                tmp_shaping = (
+                            # - self.state[6]/5  # 馬達扭矩成本
+                            - 5*L3_def
+                            - 5*L2_def
+                            - self.state[1]/5 # 功耗
+                            + 2000 * self.state[3] # 可操作性
+                        ) 
+                self.prev_shaping = tmp_shaping                     #將shaping存入上一刻shaping
+                reward = 0                                          #不給獎勵
+                # self.prev_shaping = tmp_shaping
+            elif self.state[2] != 1 and self.reachable_tmp == 1:    #上一刻可達＝1,現在不等於1
+                tmp_shaping = (
+                            + 2000 * self.state[3] # 可操作性
+                        ) 
+                self.prev_shaping = tmp_shaping
+                reward = 0
+                # self.prev_shaping = tmp_shaping
+            else:                                                   #上一刻可達!＝1,現在也不等於1
+                shaping = (
+                            + 2000 * self.state[3] # 可操作性
+                        ) 
+                if self.prev_shaping != None:
+                    reward = shaping - self.prev_shaping
+                self.prev_shaping = shaping
+
+
+            # 防止功耗計算爆掉
+            if self.state[1] > 2000:
+                reward = 0
+            self.reachable_tmp = self.state[2]
+
+            rospy.loginfo("-------------------------")
+            rospy.loginfo("shaping reward: %s", reward)
+
+            terminated = False          #是否終止
+            #L2長<=5 or L3長<=5 or L2長>=40 or L3長>=40
+            if self.state[4] <= self.MIN_LENGTH or self.state[5] <= self.MIN_LENGTH  or self.state[4] >= self.MAX_LENGTH or self.state[5] >= self.MAX_LENGTH:
+                terminated = True       #終止
+                reward += -200          #獎勵-200
+            percent = 100 - self.state[2] * 100     #差多少趴可達性到一
+            reward += -percent                      #差越多趴懲罰越多            
+            # rati o_score = self.state[0]
+            torque_score = self.state[0]            #超額扭矩數
+                
+            if self.motor_type_axis_3 in self.motor_weights:
+                self.motor_weight_axis_3 = self.motor_weights[self.motor_type_axis_3]
+
+
+            # L3_def = (1.412*(self.state[5]**3))/((self.outer_radius_std**4)-(self.state[8]**4)) #小臂撓度
+            # L2_def = ((1.412+self.motor_weight_axis_3)*(self.state[4]**3))/((self.outer_radius_std**4)-(self.state[7]**4)) #大臂撓度
+
+
+            # reward -= ratio_score * 3
+            reward -= torque_score * 3              #超額扭矩數越多，懲罰越大(超額扭矩三倍)
+            # reachable == 1
+            if percent == 0:    #可達性=1
+                # ratio_score = self.state[0]
+                torque_score = self.state[0]
+                
+                # reward -= ratio_score * 3
+                # reward -= torque_score * 3
+                if torque_score == 0:
+                    reward += 50
+                    for x in range(6):
+                        if self.torque_sum_list[x] == self.state[6]: #x越大代表馬達越小，獎勵越多
+                            reward += x * 10
+                    # terminated = True
+                    # self.counts = 0
+                    i
+
         # TODO: train case end
         if self.counts == 50: # max_steps
             terminated = True
@@ -440,13 +541,15 @@ class RobotOptEnv(gym.Env):
         self.torque_over = False #reset
        
         current_design = [self.std_L2, self.std_L3, self.motor_rated[1], self.motor_rated[2]]
+        #回傳資訊 {self.state, 獎勵，是否中止，目前的(L2長度，L3長度,第二軸馬達,第三軸馬達)}
         return self.state, reward, terminated, current_design
+    
     # reset环境状态 
     def reset(self):
         if self.model_select == "train":
             rospy.loginfo("model_select:%s", self.model_select)
             if self.action_select == 'variable':
-                self.std_L2, self.std_L3 = self.robot_urdf.opt_random_generate_write_urdf() # 啟用隨機的L2,L3長度urdf
+                self.std_L2, self.std_L3 = self.robot_urdf.opt_random_generate_write_urdf() # 啟用隨機的L2,L3長度urdf(導致長度不為整數)
             elif self.action_select == 'fixed':
                 random_total_arm_length = np.random.uniform(low=10, high=60) # FIX: 臂長長度
                 self.std_L2, self.std_L3 = self.robot_urdf.opt_specify_random_generate_write_urdf(random_total_arm_length) # 啟用隨機的L2,L3長度urdf, 並指定總臂長
@@ -487,6 +590,8 @@ class RobotOptEnv(gym.Env):
             self.state[4] = self.std_L2
             self.state[5] = self.std_L3
             self.state[6] = self.motor_type_axis_2 + self.motor_type_axis_3
+            self.state[7] = self.inner_radius_std_L2    #大臂內徑 
+            self.state[8] = self.inner_radius_std_L3    #小臂內徑
             self.counts = 0
             return self.state
         elif self.model_select == "test":
@@ -535,6 +640,8 @@ class RobotOptEnv(gym.Env):
             self.state[4] = self.std_L2
             self.state[5] = self.std_L3
             self.state[6] = self.motor_type_axis_2 + self.motor_type_axis_3
+            self.state[7] = self.inner_radius_std_L2    #大臂內徑 
+            self.state[8] = self.inner_radius_std_L3    #小臂內徑
             self.counts = 0
             return self.state        
     def original_design(self,std_L2,std_L3, motor_1, motor_2, payload, mission_time):
@@ -762,7 +869,7 @@ class RobotOptEnv(gym.Env):
         rows = sheet1.rows
         T_tmp = []
         T_traj = []
-        ik_q_traj = []
+        ik_q_traj = [] 
         ratio_over = 0
         torque_over = 0
         num_torque = np.array([np.zeros(shape=6)])
